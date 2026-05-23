@@ -357,60 +357,222 @@ def create_placeholder_image(label: str) -> Image.Image:
     return image
 
 
-def main() -> None:
-    st.set_page_config(
-        page_title="Dashboard Analisis Sampah Daur Ulang",
-        layout="wide",
+def build_gallery_image_source(
+    row: pd.Series,
+    category_col: str,
+    file_name_col: str | None,
+    search_roots: list[Path],
+) -> str | None:
+    category = str(row[category_col])
+    sample_file_name = None
+
+    if file_name_col and file_name_col in row and pd.notna(row[file_name_col]):
+        sample_file_name = str(row[file_name_col])
+
+    if sample_file_name:
+        for root in search_roots:
+            for category_dir_name in (category, slugify_category(category)):
+                if not category_dir_name:
+                    continue
+
+                local_candidate = root / category_dir_name / sample_file_name
+                if local_candidate.exists() and local_candidate.is_file():
+                    return str(local_candidate)
+
+        return build_remote_image_url(category, sample_file_name)
+
+    return resolve_category_sample_image_cached(
+        category,
+        None,
+        tuple(str(root) for root in search_roots),
     )
 
-    st.title("Dashboard Analisis Klasifikasi Sampah Daur Ulang")
-    st.markdown(
-        "Dashboard ini menampilkan hasil analisis distribusi kategori, karakteristik gambar, "
-        "dan indikasi kebutuhan preprocessing berdasarkan data hasil olahan notebook."
+
+def render_category_summary_cards(
+    df: pd.DataFrame,
+    category_col: str,
+    palette: list[tuple[str, str, str]],
+) -> None:
+    icon_map = {
+        "clothes": "👕",
+        "kaca": "🪟",
+        "kardus": "📦",
+        "kertas": "📄",
+        "logam": "⚙️",
+        "organik": "🌿",
+        "plastik": "🧴",
+        "residu": "🗑️",
+    }
+    counts = (
+        df[category_col]
+        .dropna()
+        .astype(str)
+        .value_counts()
+        .reset_index()
     )
+    counts.columns = ["kategori", "jumlah"]
 
-    clean_df = None
-    date_cols: list[str] = []
-    load_error: Exception | None = None
+    ordered_labels = prioritize_categories(counts["kategori"].tolist())[:8]
+    ordered_counts = counts.set_index("kategori").loc[ordered_labels].reset_index()
 
-    for dataset_source in get_dataset_sources():
-        try:
-            clean_df, date_cols = load_and_preprocess_dataset(dataset_source)
-            dataset_path = dataset_source
-            break
-        except Exception as exc:
-            load_error = exc
-    else:
-        st.error(
-            "Gagal memuat dataset dari URL GitHub maupun file lokal. "
-            "Periksa koneksi internet dan pastikan file CSV tersedia."
+    for row_offset in range(0, len(ordered_counts), 4):
+        row_items = ordered_counts.iloc[row_offset : row_offset + 4]
+        cols = st.columns(len(row_items))
+        for item_index, (col, (_, row)) in enumerate(zip(cols, row_items.iterrows())):
+            accent_color, bg_color, label_color = palette[(row_offset + item_index) % len(palette)]
+            icon = icon_map.get(str(row["kategori"]).lower(), "♻️")
+            with col:
+                st.markdown(
+                    f"""
+                    <div class="category-card" style="--accent:{accent_color}; --card-bg:{bg_color}; --label:{label_color};">
+                        <div class="category-card__icon">{icon}</div>
+                        <div class="category-card__label">{row['kategori']}</div>
+                        <div class="category-card__value">{int(row['jumlah']):,}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+
+def render_image_gallery(
+    filtered_df: pd.DataFrame,
+    category_col: str,
+    file_name_col: str | None,
+    available_image_roots: list[Path],
+) -> None:
+    page_size = 12
+    total_items = len(filtered_df)
+    total_pages = max(1, (total_items + page_size - 1) // page_size)
+
+    if "gallery_page" not in st.session_state:
+        st.session_state.gallery_page = 1
+
+    st.session_state.gallery_page = max(1, min(st.session_state.gallery_page, total_pages))
+
+    nav_left, nav_center, nav_right = st.columns([1, 2, 1])
+    with nav_left:
+        prev_disabled = st.session_state.gallery_page <= 1
+        if st.button("◀ Prev", disabled=prev_disabled, use_container_width=True):
+            st.session_state.gallery_page -= 1
+            st.rerun()
+    with nav_center:
+        st.markdown(
+            f"<div class='gallery-counter'>Halaman {st.session_state.gallery_page} / {total_pages} · {total_items:,} gambar ditemukan</div>",
+            unsafe_allow_html=True,
         )
-        if load_error is not None:
-            st.exception(load_error)
-        st.stop()
+    with nav_right:
+        next_disabled = st.session_state.gallery_page >= total_pages
+        if st.button("Next ▶", disabled=next_disabled, use_container_width=True):
+            st.session_state.gallery_page += 1
+            st.rerun()
 
-    assert clean_df is not None
+    start_idx = (st.session_state.gallery_page - 1) * page_size
+    end_idx = start_idx + page_size
+    page_df = filtered_df.iloc[start_idx:end_idx]
 
-    category_col = find_existing_column(clean_df, ["kategori", "class_label", "category"])
-    file_name_col = find_existing_column(clean_df, ["nama_file", "file_name"])
-    size_col = find_existing_column(clean_df, ["ukuran_file_kb", "file_size_kb"])
-    pixel_col = find_existing_column(clean_df, ["jumlah_piksel", "pixels"])
+    if page_df.empty:
+        st.info("Tidak ada gambar untuk ditampilkan pada halaman ini.")
+        return
 
-    st.caption(f"Sumber data aktif: {dataset_path}")
+    columns_per_row = 4
+    rows = [page_df.iloc[i : i + columns_per_row] for i in range(0, len(page_df), columns_per_row)]
+    gallery_found = 0
 
-    filtered_df, selected_date_col = sidebar_filters(clean_df, category_col, date_cols)
+    for chunk in rows:
+        cols = st.columns(columns_per_row)
+        for idx, (_, row) in enumerate(chunk.iterrows()):
+            with cols[idx]:
+                category = str(row[category_col])
+                img_source = build_gallery_image_source(row, category_col, file_name_col, available_image_roots)
+                caption = str(row[file_name_col]) if file_name_col and file_name_col in row and pd.notna(row[file_name_col]) else category
 
-    raw_images_root = Path("images")
-    curated_images_root = Path("clean_images_filtered")
-    available_image_roots = [
-        root for root in (raw_images_root, curated_images_root)
-        if root.exists() and root.is_dir()
+                if img_source is not None:
+                    try:
+                        if img_source.startswith("http"):
+                            st.image(img_source, use_container_width=True)
+                        else:
+                            st.image(Image.open(Path(img_source)), use_container_width=True)
+                        gallery_found += 1
+                    except Exception:
+                        st.image(create_placeholder_image(category), use_container_width=True)
+                else:
+                    st.image(create_placeholder_image(category), use_container_width=True)
+
+                st.markdown(
+                    f"""
+                    <div class="gallery-card">
+                        <div class="gallery-card__badge">{category}</div>
+                        <div class="gallery-card__caption">{caption}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+    st.markdown(
+        f"**Insight:** {gallery_found} gambar pada halaman ini berhasil dimuat dari sumber dataset. "
+        + (
+            "Jika ada kartu placeholder, artinya file gambar yang cocok belum ditemukan di sumber lokal/remote."
+            if gallery_found < len(page_df)
+            else "Semua kartu pada halaman ini menampilkan gambar asli."
+        )
+    )
+
+
+def render_page_header(title: str, subtitle: str) -> None:
+    st.markdown(
+        f"""
+        <div class="hero-banner">
+            <div class="hero-title">{title}</div>
+            <p class="hero-subtitle">{subtitle}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_gallery_page(
+    filtered_df: pd.DataFrame,
+    category_col: str | None,
+    file_name_col: str | None,
+    available_image_roots: list[Path],
+    total_data_count: int,
+) -> None:
+    render_page_header(
+        "🖼️ Galeri Gambar Sampah",
+        "Jelajahi koleksi gambar sampah daur ulang per kategori dengan navigasi halaman yang rapi dan fokus ke visual.",
+    )
+
+    if not category_col or filtered_df.empty:
+        st.info("Pilih filter kategori agar galeri bisa ditampilkan.")
+        return
+
+    category_palette = [
+        ("#3d8bfd", "#eff7ff", "#2f6fe0"),
+        ("#5aa9ff", "#f4faff", "#3f89eb"),
+        ("#7cc4ff", "#f5fbff", "#5ea8eb"),
+        ("#98d1ff", "#f8fcff", "#6fb7ee"),
+        ("#6e9eff", "#eef5ff", "#4f7fe0"),
+        ("#86bfff", "#f2f8ff", "#5f9ae8"),
+        ("#4f8ff7", "#edf4ff", "#2f6fe0"),
+        ("#b5dcff", "#fbfdff", "#7fb9f1"),
     ]
-    preferred_root = raw_images_root if raw_images_root.exists() and raw_images_root.is_dir() else None
-    if preferred_root is None and curated_images_root.exists() and curated_images_root.is_dir():
-        preferred_root = curated_images_root
+    render_category_summary_cards(filtered_df, category_col, category_palette)
+    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+    render_image_gallery(filtered_df, category_col, file_name_col, available_image_roots)
 
-    total_data_count = len(clean_df)
+
+def render_analytics_page(
+    filtered_df: pd.DataFrame,
+    category_col: str | None,
+    size_col: str | None,
+    pixel_col: str | None,
+    selected_date_col: str | None,
+    total_data_count: int,
+) -> None:
+    render_page_header(
+        "📊 Hasil Analisis",
+        "Lihat ringkasan statistik, distribusi fitur, korelasi, dan insight preprocessing dari data yang sudah difilter.",
+    )
 
     with st.container():
         st.subheader("Data")
@@ -422,10 +584,10 @@ def main() -> None:
         with col_right:
             st.markdown("### Ringkasan")
             st.metric("Jumlah Data", f"{total_data_count:,}")
-            if size_col and not clean_df.empty:
-                st.metric("Rata-rata ukuran file (KB)", f"{clean_df[size_col].mean():.2f}")
-            if category_col and not clean_df.empty:
-                st.metric("Jumlah kategori", clean_df[category_col].nunique())
+            if size_col and not filtered_df.empty:
+                st.metric("Rata-rata ukuran file (KB)", f"{filtered_df[size_col].mean():.2f}")
+            if category_col and not filtered_df.empty:
+                st.metric("Jumlah kategori", filtered_df[category_col].nunique())
 
     with st.container():
         st.subheader("Ringkasan Statistik")
@@ -449,16 +611,14 @@ def main() -> None:
                 )
                 class_dist["persen"] = class_dist["jumlah_data"] / class_dist["jumlah_data"].sum() * 100
                 fig1, ax1 = plt.subplots(figsize=(8, 4.5))
-                sns.barplot(data=class_dist, x="kategori", y="jumlah_data", palette="viridis", ax=ax1)
+                sns.barplot(data=class_dist, x="kategori", y="jumlah_data", palette="Blues", ax=ax1)
                 ax1.set_title("Distribusi Jumlah Data per Kategori")
                 ax1.set_xlabel("Kategori")
                 ax1.set_ylabel("Jumlah Data")
                 ax1.tick_params(axis="x", rotation=25)
-                # annotate percent on bars
                 for p, pct in zip(ax1.patches, class_dist["persen"]):
                     height = p.get_height()
-                    ax1.annotate(f"{pct:.1f}%", (p.get_x() + p.get_width() / 2, height),
-                                 ha="center", va="bottom", fontsize=9)
+                    ax1.annotate(f"{pct:.1f}%", (p.get_x() + p.get_width() / 2, height), ha="center", va="bottom", fontsize=9)
                 st.pyplot(fig1)
 
                 if not class_dist.empty:
@@ -504,7 +664,7 @@ def main() -> None:
                     .sort_values(ascending=False)
                     .reset_index()
                 )
-                sns.lineplot(data=trend_alt, x=category_col, y=size_col, marker="o", ax=ax2)
+                sns.lineplot(data=trend_alt, x=category_col, y=size_col, marker="o", color="#2f6fe0", ax=ax2)
                 ax2.set_title("Perbandingan Median Ukuran File per Kategori")
                 ax2.set_xlabel("Kategori")
                 ax2.set_ylabel("Median Ukuran File (KB)")
@@ -534,7 +694,7 @@ def main() -> None:
         if numeric_for_corr.shape[1] >= 2:
             fig3, ax3 = plt.subplots(figsize=(10, 5))
             corr_matrix = numeric_for_corr.corr(numeric_only=True)
-            sns.heatmap(corr_matrix, annot=True, fmt=".2f", cmap="YlGnBu", ax=ax3)
+            sns.heatmap(corr_matrix, annot=True, fmt=".2f", cmap="Blues", ax=ax3)
             ax3.set_title("Heatmap Korelasi Fitur Numerik")
             st.pyplot(fig3)
 
@@ -560,7 +720,7 @@ def main() -> None:
         with size_col1:
             if size_col and not filtered_df.empty:
                 fig_size_hist, ax_size_hist = plt.subplots(figsize=(8, 4.5))
-                sns.histplot(filtered_df[size_col], bins=40, kde=True, color="#1b4965", ax=ax_size_hist)
+                sns.histplot(filtered_df[size_col], bins=40, kde=True, color="#4f8ff7", ax=ax_size_hist)
                 ax_size_hist.set_title("Histogram Ukuran File (KB)")
                 ax_size_hist.set_xlabel("Ukuran File (KB)")
                 ax_size_hist.set_ylabel("Jumlah Gambar")
@@ -578,13 +738,7 @@ def main() -> None:
         with size_col2:
             if category_col and size_col and not filtered_df.empty:
                 fig_size_box, ax_size_box = plt.subplots(figsize=(8, 4.5))
-                sns.boxplot(
-                    data=filtered_df,
-                    x=category_col,
-                    y=size_col,
-                    palette="Set2",
-                    ax=ax_size_box,
-                )
+                sns.boxplot(data=filtered_df, x=category_col, y=size_col, palette="Blues", ax=ax_size_box)
                 ax_size_box.set_title("Boxplot Ukuran File per Kategori")
                 ax_size_box.set_xlabel("Kategori")
                 ax_size_box.set_ylabel("Ukuran File (KB)")
@@ -594,8 +748,7 @@ def main() -> None:
                 medians = filtered_df.groupby(category_col)[size_col].median().sort_values(ascending=False)
                 if not medians.empty:
                     st.markdown(
-                        f"**Insight:** Median ukuran file tertinggi berada pada **{medians.index[0]}** "
-                        f"dan terendah pada **{medians.index[-1]}**, menandakan perbedaan karakteristik visual antar kategori."
+                        f"**Insight:** Median ukuran file tertinggi berada pada **{medians.index[0]}** dan terendah pada **{medians.index[-1]}**, menandakan perbedaan karakteristik visual antar kategori."
                     )
             else:
                 st.info("Boxplot ukuran file membutuhkan kolom kategori dan ukuran file.")
@@ -614,7 +767,7 @@ def main() -> None:
                 dev_df.columns = ["kategori", "deviasi_persen"]
 
                 fig_dev, ax_dev = plt.subplots(figsize=(8, 4.5))
-                sns.barplot(data=dev_df, x="kategori", y="deviasi_persen", palette="crest", ax=ax_dev)
+                sns.barplot(data=dev_df, x="kategori", y="deviasi_persen", palette="Blues", ax=ax_dev)
                 ax_dev.set_title("Deviasi Median Ukuran File per Kategori")
                 ax_dev.set_xlabel("Kategori")
                 ax_dev.set_ylabel("Deviasi (%)")
@@ -624,8 +777,7 @@ def main() -> None:
                 top_dev = dev_df.head(2)["kategori"].tolist()
                 if top_dev:
                     st.markdown(
-                        f"**Insight:** Deviasi median terbesar berasal dari kategori {', '.join(top_dev)}. "
-                        "Kategori ini perlu perhatian khusus saat standarisasi ukuran input."
+                        f"**Insight:** Deviasi median terbesar berasal dari kategori {', '.join(top_dev)}. Kategori ini perlu perhatian khusus saat standarisasi ukuran input."
                     )
             else:
                 st.info("Deviasi median membutuhkan kolom kategori dan ukuran file.")
@@ -641,7 +793,7 @@ def main() -> None:
                 outlier_df.columns = ["kategori", "outlier_rate"]
 
                 fig_outlier, ax_outlier = plt.subplots(figsize=(8, 4.5))
-                sns.barplot(data=outlier_df, x="kategori", y="outlier_rate", palette="flare", ax=ax_outlier)
+                sns.barplot(data=outlier_df, x="kategori", y="outlier_rate", palette="Blues", ax=ax_outlier)
                 ax_outlier.set_title("Outlier Rate Ukuran File (IQR)")
                 ax_outlier.set_xlabel("Kategori")
                 ax_outlier.set_ylabel("Outlier Rate (%)")
@@ -653,7 +805,7 @@ def main() -> None:
                     st.markdown(
                         "**Insight:** Outlier ukuran file >=5% muncul pada kategori: "
                         + ", ".join(high_outliers)
-                        + ". Ini menandakan perlunya QC tambahan atau trimming." 
+                        + ". Ini menandakan perlunya QC tambahan atau trimming."
                     )
                 else:
                     st.markdown("**Insight:** Tidak ada kategori dengan outlier rate di atas 5%.")
@@ -664,13 +816,7 @@ def main() -> None:
         st.subheader("Distribusi Jumlah Piksel")
         if category_col and pixel_col and not filtered_df.empty:
             fig_px, ax_px = plt.subplots(figsize=(10, 5))
-            sns.violinplot(
-                data=filtered_df,
-                x=category_col,
-                y=pixel_col,
-                palette="muted",
-                ax=ax_px,
-            )
+            sns.violinplot(data=filtered_df, x=category_col, y=pixel_col, palette="Blues", ax=ax_px)
             ax_px.set_title("Violin Plot Jumlah Piksel per Kategori")
             ax_px.set_xlabel("Kategori")
             ax_px.set_ylabel("Jumlah Piksel")
@@ -680,8 +826,7 @@ def main() -> None:
             pixel_medians = filtered_df.groupby(category_col)[pixel_col].median().sort_values(ascending=False)
             if not pixel_medians.empty:
                 st.markdown(
-                    f"**Insight:** Median jumlah piksel tertinggi berada pada **{pixel_medians.index[0]}**, "
-                    "mengindikasikan resolusi rata-rata lebih besar pada kategori tersebut."
+                    f"**Insight:** Median jumlah piksel tertinggi berada pada **{pixel_medians.index[0]}**, mengindikasikan resolusi rata-rata lebih besar pada kategori tersebut."
                 )
         else:
             st.info("Violin plot jumlah piksel membutuhkan kolom kategori dan jumlah piksel.")
@@ -692,80 +837,383 @@ def main() -> None:
             st.markdown(f"- {insight}")
 
     with st.container():
-        st.subheader("Contoh Gambar per Kategori")
-        if category_col and not filtered_df.empty:
-            image_roots = available_image_roots
-            categories = prioritize_categories(sorted(filtered_df[category_col].dropna().astype(str).unique()))
-            if not categories:
-                st.info("Tidak ada kategori untuk ditampilkan gambar.")
-            else:
-                if preferred_root is not None:
-                    st.info(f"Menggunakan sumber gambar lokal: {preferred_root}")
-                    search_roots = [preferred_root]
-                elif image_roots:
-                    root_options = ["Gabungan (semua)"] + [str(p) for p in image_roots]
-                    chosen = st.selectbox("Pilih folder gambar (sumber)", options=root_options, index=0)
-                    if chosen == "Gabungan (semua)":
-                        search_roots = image_roots
-                    else:
-                        search_roots = [Path(chosen)]
-                else:
-                    search_roots = []
-                    st.info("Folder gambar lokal tidak ditemukan, jadi contoh gambar diambil dari raw GitHub.")
-
-                cols = st.columns(min(8, len(categories)))
-                real_image_count = 0
-                missing_categories: list[str] = []
-                selected_preview_categories = [cat for cat in ["Clothes", "Organik"] if cat in categories]
-                selected_preview_categories += [cat for cat in categories if cat not in selected_preview_categories][: max(0, 8 - len(selected_preview_categories))]
-
-                for i, cat in enumerate(selected_preview_categories):
-                    sample_file_name = None
-                    if file_name_col:
-                        category_rows = filtered_df[filtered_df[category_col].astype(str) == cat]
-                        if not category_rows.empty:
-                            sample_series = category_rows[file_name_col].dropna().astype(str)
-                            if not sample_series.empty:
-                                sample_file_name = sample_series.iloc[0]
-
-                    img_source = resolve_category_sample_image_cached(
-                        cat,
-                        sample_file_name,
-                        tuple(str(root) for root in search_roots),
-                    )
-                    col = cols[i % len(cols)]
-
-                    with col:
-                        if img_source is not None:
-                            try:
-                                if img_source.startswith("http"):
-                                    st.image(img_source, width="stretch", caption=str(cat))
-                                else:
-                                    st.image(Image.open(Path(img_source)), width="stretch", caption=str(cat))
-                                real_image_count += 1
-                            except Exception:
-                                st.image(create_placeholder_image(str(cat)), width="stretch", caption=str(cat))
-                                missing_categories.append(str(cat))
-                        else:
-                            st.image(create_placeholder_image(str(cat)), width="stretch", caption=str(cat))
-                            missing_categories.append(str(cat))
-
-                st.markdown(
-                    f"**Insight:** Ada **{real_image_count}** kategori yang berhasil diambil langsung dari file gambar di sumber terpilih. "
-                    + (
-                        f"Kategori tanpa file contoh yang cocok: {', '.join(missing_categories)}."
-                        if missing_categories
-                        else "Semua kategori yang sedang difilter punya contoh gambar dari sumber terpilih."
-                    )
-                )
-
-    with st.container():
         st.subheader("Kesimpulan")
         st.markdown(
             "- Distribusi data antar kategori masih perlu dipantau untuk mencegah bias model pada kelas mayoritas.\n"
             "- Perbedaan karakteristik ukuran file dan resolusi antar kategori menguatkan kebutuhan preprocessing yang konsisten sekaligus adaptif.\n"
             "- Dashboard interaktif ini dapat digunakan untuk menentukan prioritas augmentasi data, class weight, dan quality control sebelum tahap modeling."
         )
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title="Dashboard Analisis Sampah Daur Ulang",
+        layout="wide",
+    )
+
+    st.markdown(
+        """
+        <style>
+        :root {
+            --bg: #eef6ff;
+            --surface: rgba(255, 255, 255, 0.86);
+            --surface-strong: rgba(255, 255, 255, 0.96);
+            --border: rgba(79, 143, 247, 0.14);
+            --primary-blue: #4f8ff7;
+            --primary-blue-dark: #2f6fe0;
+            --primary-blue-soft: #eaf3ff;
+            --surface-blue: #f7fbff;
+            --text-strong: #123056;
+            --text-soft: #5f7896;
+            --shadow: 0 18px 45px rgba(47, 111, 224, 0.10);
+        }
+        .stApp {
+            background:
+                radial-gradient(circle at top left, rgba(79, 143, 247, 0.10), transparent 35%),
+                radial-gradient(circle at top right, rgba(122, 196, 255, 0.08), transparent 28%),
+                linear-gradient(180deg, #f7fbff 0%, var(--bg) 100%);
+            color: var(--text-strong);
+        }
+        .block-container {
+            padding-top: 1.25rem;
+            padding-bottom: 2rem;
+            max-width: 1520px;
+        }
+        .hero-banner {
+            background: linear-gradient(135deg, #eff7ff 0%, #dfeeff 100%);
+            border-radius: 28px;
+            padding: 2rem 2.2rem;
+            color: var(--text-strong);
+            box-shadow: var(--shadow);
+            margin-bottom: 1.25rem;
+            border: 1px solid var(--border);
+            position: relative;
+            overflow: hidden;
+        }
+        .hero-banner::after {
+            content: "";
+            position: absolute;
+            inset: auto -4rem -4rem auto;
+            width: 11rem;
+            height: 11rem;
+            background: radial-gradient(circle, rgba(79, 143, 247, 0.22) 0%, rgba(79, 143, 247, 0) 70%);
+            pointer-events: none;
+        }
+        .hero-title {
+            font-size: clamp(1.7rem, 3vw, 2.4rem);
+            font-weight: 800;
+            margin: 0 0 0.45rem 0;
+            letter-spacing: -0.03em;
+        }
+        .hero-subtitle {
+            color: var(--text-soft);
+            font-size: clamp(0.95rem, 1.5vw, 1.02rem);
+            margin: 0;
+            max-width: 62rem;
+        }
+        .section-divider {
+            margin: 1rem 0 1.3rem 0;
+        }
+        .gallery-counter {
+            text-align: center;
+            color: var(--text-soft);
+            font-weight: 600;
+            padding-top: 0.6rem;
+        }
+        section[data-testid="stSidebar"] {
+            background: linear-gradient(180deg, #f8fbff 0%, #eef6ff 100%);
+            border-right: 1px solid rgba(79, 143, 247, 0.12);
+        }
+        section[data-testid="stSidebar"] > div {
+            padding-top: 1rem;
+        }
+        .sidebar-brand {
+            background: linear-gradient(135deg, #eff7ff 0%, #dfeeff 100%);
+            border: 1px solid rgba(79, 143, 247, 0.16);
+            border-radius: 22px;
+            padding: 1rem 1rem 0.9rem 1rem;
+            box-shadow: 0 12px 28px rgba(47, 111, 224, 0.08);
+            margin-bottom: 1rem;
+        }
+        .sidebar-brand__eyebrow {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            font-size: 0.78rem;
+            font-weight: 800;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: #2f6fe0;
+            background: rgba(255,255,255,0.72);
+            border: 1px solid rgba(79, 143, 247, 0.14);
+            border-radius: 999px;
+            padding: 0.3rem 0.7rem;
+            margin-bottom: 0.75rem;
+        }
+        .sidebar-brand__title {
+            font-size: 1.15rem;
+            font-weight: 800;
+            color: var(--text-strong);
+            margin: 0;
+            line-height: 1.2;
+        }
+        .sidebar-brand__subtitle {
+            color: var(--text-soft);
+            font-size: 0.86rem;
+            margin-top: 0.35rem;
+            line-height: 1.4;
+        }
+        .sidebar-section-title {
+            font-size: 0.76rem;
+            font-weight: 800;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: #5f7896;
+            margin: 1rem 0 0.55rem 0;
+        }
+        .sidebar-note {
+            background: rgba(255,255,255,0.72);
+            border: 1px solid rgba(79, 143, 247, 0.12);
+            border-radius: 18px;
+            padding: 0.8rem 0.85rem;
+            color: var(--text-soft);
+            font-size: 0.85rem;
+            line-height: 1.45;
+            margin-bottom: 1rem;
+        }
+        section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {
+            padding-top: 1rem;
+        }
+        section[data-testid="stSidebar"] [data-testid="stSidebarNav"] {
+            padding-top: 0.5rem;
+        }
+        section[data-testid="stSidebar"] [data-testid="stSidebarNav"] a {
+            border-radius: 14px;
+            margin-bottom: 0.35rem;
+        }
+        section[data-testid="stSidebar"] [data-testid="stSidebarNav"] a[aria-current="page"] {
+            background: rgba(79, 143, 247, 0.12);
+        }
+        section[data-testid="stSidebar"] .stRadio > div {
+            gap: 0.2rem;
+        }
+        section[data-testid="stSidebar"] .stRadio label {
+            background: rgba(255,255,255,0.72);
+            border: 1px solid rgba(79, 143, 247, 0.12);
+            border-radius: 16px;
+            padding: 0.65rem 0.8rem;
+            margin-bottom: 0.45rem;
+            box-shadow: 0 8px 16px rgba(47, 111, 224, 0.04);
+        }
+        section[data-testid="stSidebar"] .stRadio label:hover {
+            border-color: rgba(47, 111, 224, 0.22);
+            background: rgba(239, 247, 255, 0.98);
+        }
+        section[data-testid="stSidebar"] .stRadio div[role="radiogroup"] {
+            gap: 0.25rem;
+        }
+        section[data-testid="stSidebar"] .stMultiSelect [data-baseweb="select"] > div,
+        section[data-testid="stSidebar"] .stSelectbox [data-baseweb="select"] > div,
+        section[data-testid="stSidebar"] .stDateInput input,
+        section[data-testid="stSidebar"] .stNumberInput input,
+        section[data-testid="stSidebar"] .stTextInput input {
+            background: rgba(255,255,255,0.9);
+            border-radius: 16px !important;
+            border-color: rgba(79, 143, 247, 0.14) !important;
+        }
+        section[data-testid="stSidebar"] .stSlider {
+            padding-top: 0.15rem;
+        }
+        .stButton > button {
+            border-radius: 999px;
+            border: 1px solid rgba(79, 143, 247, 0.16);
+            background: linear-gradient(180deg, #ffffff 0%, #f3f8ff 100%);
+            color: var(--text-strong);
+            box-shadow: 0 10px 18px rgba(47, 111, 224, 0.08);
+            transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+        }
+        .stButton > button:hover {
+            transform: translateY(-1px);
+            border-color: rgba(47, 111, 224, 0.28);
+            box-shadow: 0 14px 24px rgba(47, 111, 224, 0.12);
+        }
+        .stMetric {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 18px;
+            padding: 1rem 1rem 0.85rem 1rem;
+            box-shadow: 0 10px 24px rgba(47, 111, 224, 0.05);
+        }
+        .stMetric label {
+            color: var(--text-soft) !important;
+        }
+        [data-testid="stDataFrame"] {
+            border-radius: 18px;
+            overflow: hidden;
+            border: 1px solid var(--border);
+            box-shadow: 0 10px 24px rgba(47, 111, 224, 0.05);
+        }
+        [data-testid="stSelectbox"], [data-testid="stMultiSelect"], [data-testid="stDateInput"], [data-testid="stSlider"] {
+            border-radius: 16px;
+        }
+        .category-card {
+            border-radius: 18px;
+            padding: 1rem 0.85rem;
+            text-align: center;
+            background: linear-gradient(180deg, var(--card-bg), #ffffff);
+            border: 1px solid color-mix(in srgb, var(--accent) 24%, white 76%);
+            box-shadow: 0 10px 24px rgba(47, 111, 224, 0.07);
+            margin-bottom: 0.5rem;
+            min-height: 11rem;
+        }
+        .category-card__icon {
+            font-size: clamp(1.5rem, 2vw, 1.95rem);
+            line-height: 1;
+            margin-bottom: 0.55rem;
+        }
+        .category-card__label {
+            color: var(--label);
+            font-weight: 800;
+            font-size: clamp(0.88rem, 1.2vw, 0.98rem);
+            margin-bottom: 0.35rem;
+        }
+        .category-card__value {
+            color: var(--text-strong);
+            font-size: clamp(1.15rem, 2vw, 1.45rem);
+            font-weight: 800;
+        }
+        .gallery-card {
+            margin-top: 0.45rem;
+            margin-bottom: 1rem;
+            padding: 0.7rem 0.8rem;
+            border-radius: 14px;
+            background: rgba(255,255,255,0.9);
+            border: 1px solid rgba(79, 143, 247, 0.16);
+            box-shadow: 0 8px 16px rgba(47, 111, 224, 0.05);
+        }
+        .gallery-card__badge {
+            display: inline-block;
+            font-size: 0.8rem;
+            font-weight: 800;
+            color: #245bb8;
+            background: #e8f2ff;
+            border-radius: 999px;
+            padding: 0.24rem 0.7rem;
+            margin-bottom: 0.45rem;
+        }
+        .gallery-card__caption {
+            color: var(--text-soft);
+            font-size: 0.84rem;
+            word-break: break-word;
+        }
+        @media (max-width: 768px) {
+            .hero-banner {
+                padding: 1.4rem 1.2rem;
+                border-radius: 22px;
+            }
+            .hero-title {
+                font-size: 1.55rem;
+            }
+            .hero-subtitle {
+                font-size: 0.95rem;
+            }
+            .category-card {
+                min-height: 9.5rem;
+                padding: 0.9rem 0.75rem;
+            }
+            .gallery-card {
+                padding: 0.65rem 0.7rem;
+            }
+        }
+        @media (max-width: 640px) {
+            .block-container {
+                padding-left: 1rem;
+                padding-right: 1rem;
+            }
+            .stButton > button {
+                width: 100%;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    clean_df = None
+    date_cols: list[str] = []
+    load_error: Exception | None = None
+
+    for dataset_source in get_dataset_sources():
+        try:
+            clean_df, date_cols = load_and_preprocess_dataset(dataset_source)
+            dataset_path = dataset_source
+            break
+        except Exception as exc:
+            load_error = exc
+    else:
+        st.error(
+            "Gagal memuat dataset dari URL GitHub maupun file lokal. "
+            "Periksa koneksi internet dan pastikan file CSV tersedia."
+        )
+        if load_error is not None:
+            st.exception(load_error)
+        st.stop()
+
+    assert clean_df is not None
+
+    category_col = find_existing_column(clean_df, ["kategori", "class_label", "category"])
+    file_name_col = find_existing_column(clean_df, ["nama_file", "file_name"])
+    size_col = find_existing_column(clean_df, ["ukuran_file_kb", "file_size_kb"])
+    pixel_col = find_existing_column(clean_df, ["jumlah_piksel", "pixels"])
+
+    st.sidebar.markdown(
+        """
+        <div class="sidebar-brand">
+            <div class="sidebar-brand__eyebrow">♻️ Sampah Explorer</div>
+            <div class="sidebar-brand__title">Dashboard Sampah Daur Ulang</div>
+            <div class="sidebar-brand__subtitle">Navigasi cepat ke galeri dan analitik data gambar.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.sidebar.markdown('<div class="sidebar-section-title">Navigasi</div>', unsafe_allow_html=True)
+    page = st.sidebar.radio(
+        "Pilih halaman",
+        options=["Gallery", "Analytics"],
+        index=0,
+        label_visibility="collapsed",
+    )
+
+    st.sidebar.markdown(
+        f"""
+        <div class="sidebar-note">
+            <strong>Sumber aktif</strong><br>
+            {dataset_path}<br>
+            <span style="opacity:0.92;">Pilih halaman untuk fokus pada gambar atau hasil analisis.</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.sidebar.markdown('<div class="sidebar-section-title">Filter</div>', unsafe_allow_html=True)
+    filtered_df, selected_date_col = sidebar_filters(clean_df, category_col, date_cols)
+
+    raw_images_root = Path("images")
+    curated_images_root = Path("clean_images_filtered")
+    available_image_roots = [
+        root for root in (raw_images_root, curated_images_root)
+        if root.exists() and root.is_dir()
+    ]
+
+    total_data_count = len(clean_df)
+
+    st.caption(f"Sumber data aktif: {dataset_path}")
+
+    if page == "Gallery":
+        render_gallery_page(filtered_df, category_col, file_name_col, available_image_roots, total_data_count)
+    else:
+        render_analytics_page(filtered_df, category_col, size_col, pixel_col, selected_date_col, total_data_count)
 
 
 if __name__ == "__main__":
